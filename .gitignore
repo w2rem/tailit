@@ -1,0 +1,7 @@
+test-space
+*.log
+.env
+__pycache__/
+# .streamlit/config.toml нужен на Streamlit Cloud (fileWatcherType=poll против inotify limit) — не игнорим
+# .streamlit/
+*.pyc
