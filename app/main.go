@@ -152,6 +152,41 @@ func trunc(s string, n int) string {
 	return s
 }
 
+func sweepAll(client *http.Client, cfg Config) {
+	mu.Lock()
+	kept := results[:0]
+	for _, old := range results {
+		seen := false
+		for _, p := range cfg.Peers {
+			if old.URL == strings.TrimSuffix(strings.TrimSpace(p), "/") {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			kept = append(kept, old)
+		}
+	}
+	results = kept
+	mu.Unlock()
+	for _, peer := range cfg.Peers {
+		r := checkPeer(client, peer)
+		mu.Lock()
+		kept := results[:0]
+		for _, old := range results {
+			if old.URL != r.URL {
+				kept = append(kept, old)
+			}
+		}
+		results = append(kept, r)
+		mu.Unlock()
+		log.Printf("peer %s -> %d %s %dms ok=%v", r.URL, r.Status, r.State, r.LatencyMs, r.OK)
+	}
+	mu.Lock()
+	ready = true
+	mu.Unlock()
+}
+
 func pinger(cfg Config) {
 	if len(cfg.Peers) == 0 {
 		mu.Lock()
@@ -168,10 +203,10 @@ func pinger(cfg Config) {
 		},
 	}
 	idx := 0
-	checked := 0
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	log.Printf("pinger: %d peer(s), every %s, round-robin", len(cfg.Peers), cfg.Interval)
+	sweepAll(client, cfg) // immediate first sweep — no waiting for the first tick
 	for range ticker.C {
 		peer := cfg.Peers[idx%len(cfg.Peers)]
 		idx++
@@ -185,10 +220,6 @@ func pinger(cfg Config) {
 			}
 		}
 		results = append(kept, r)
-		checked++
-		if checked >= len(cfg.Peers) {
-			ready = true // first full sweep done
-		}
 		mu.Unlock()
 		log.Printf("peer %s -> %d %s %dms ok=%v", r.URL, r.Status, r.State, r.LatencyMs, r.OK)
 	}
@@ -229,7 +260,7 @@ func main() {
 		if out == nil {
 			out = []PeerResult{}
 		}
-		writeJSON(w, map[string]any{"peers": out, "interval_sec": int(cfg.Interval / time.Second)}, 200)
+		writeJSON(w, map[string]any{"peers": out, "configured": cfg.Peers, "interval_sec": int(cfg.Interval / time.Second)}, 200)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

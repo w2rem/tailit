@@ -895,6 +895,38 @@ def _go_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _config_fingerprint() -> str:
+    """Hash of env knobs that require a Go restart when changed."""
+    import hashlib
+
+    keys = ("TS_PEERS", "TS_PORT", "GO_PORT", "TS_PEER_INTERVAL", "TS_HOST", "TS_VERSION", "TAILIT_GO")
+    blob = "|".join(f"{k}={os.environ.get(k, '').strip()}" for k in keys)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def _kill_go() -> None:
+    """Kill stale tailit-app processes so a new one picks up fresh env."""
+    log("killing stale Go sidecar", event="go.kill")
+    for cmd in (["pkill", "-f", "tailit-app"], ["killall", "tailit-app"]):
+        try:
+            subprocess.run(cmd, timeout=3, capture_output=True)
+        except Exception:
+            pass
+    try:
+        import glob as _g
+
+        for pid in _g.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(pid, "rb") as f:
+                    if b"tailit-app" in f.read():
+                        os.kill(int(pid.split("/")[2]), 15)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(1.5)
+
+
 def _write_go_status(status: str) -> None:
     try:
         os.makedirs(INSTALL_DIR, exist_ok=True)
@@ -912,10 +944,20 @@ def maybe_run_go_app() -> str:
         _write_go_status(status)
         return status
     try:
+        _kill_go()  # stale process holds old TS_PEERS — always start fresh
         go_bin = ensure_go()
         app_bin = build_go_app()
         proc = run_go_app(app_bin)
-        status = f"running pid={proc.pid} go={go_bin}"
+        peers = os.environ.get("TS_PEERS", "").strip()
+        n_peers = len([p for p in peers.replace(",", " ").split() if p])
+        fp = _config_fingerprint()
+        try:
+            with open(os.path.join(INSTALL_DIR, "env.fingerprint"), "w") as f:
+                f.write(fp)
+        except OSError:
+            pass
+        status = f"running pid={proc.pid} go={go_bin} peers={n_peers} fp={fp}"
+        log_ok(f"Go app running with fresh env", event="go.running", pid=proc.pid, peers=n_peers, fp=fp)
         _write_go_status(status)
         return status
     except Exception as e:  # noqa: BLE001
@@ -936,111 +978,7 @@ def _run_as_streamlit_app() -> None:
     st.set_page_config(page_title="tailit", layout="centered")
     st.title("tailit")
 
-    # Live CPU / RAM
-    try:
-        auto_metrics = st.fragment(run_every=2)
-    except TypeError:
-        auto_metrics = st.fragment
-
-    @auto_metrics
-    def _live_metrics() -> None:
-        try:
-            total_mb, avail_mb = _read_mem_mb()
-            used_mb = total_mb - avail_mb
-            ram_pct = round(used_mb / total_mb * 100, 1) if total_mb else 0.0
-            ram_line = f"{_fmt_mb(used_mb)} / {_fmt_mb(total_mb)} ({ram_pct}%) — free {_fmt_mb(avail_mb)}"
-        except OSError:
-            ram_line = "unknown"
-        cpu = _cpu_pct()
-        cpu_line = f"{cpu}%" if cpu is not None else "unknown"
-        c1, c2 = st.columns(2)
-        c1.metric("CPU", cpu_line)
-        c2.metric("RAM", ram_line)
-
-    _live_metrics()
-
-    # Live public IP / geo
-    try:
-        auto_geo = st.fragment(run_every=60)
-    except TypeError:
-        auto_geo = st.fragment
-
-    @auto_geo
-    def _live_geo() -> None:
-        now = time.monotonic()
-        cached = st.session_state.get("tailit_geo") or {}
-        ts = st.session_state.get("tailit_geo_ts", 0.0)
-        if not cached or now - ts > 60:
-            try:
-                data = _fetch_geoip()
-                st.session_state["tailit_geo"] = data
-                st.session_state["tailit_geo_ts"] = now
-            except Exception:  # noqa: BLE001
-                data = cached
-        else:
-            data = cached
-        if not data:
-            st.metric("Public IP", "unknown")
-            return
-        country = f"{data.get('country', '')} {data.get('country_code', '')}".strip() or "unknown"
-        isp = (data.get("isp", "") or data.get("organization", "")) or "unknown"
-        asn = f"AS{data['asn']}" if data.get("asn") else "unknown"
-        g1, g2 = st.columns(2)
-        g1.metric("Public IP", str(data.get("ip", "unknown")))
-        g2.metric("Country", country)
-        g3, g4 = st.columns(2)
-        g3.metric("ISP", str(isp)[:32])
-        g4.metric("ASN", asn)
-        tz = str(data.get("timezone", "") or "").strip()
-        lat, lon = data.get("latitude", ""), data.get("longitude", "")
-        extra = " / ".join(p for p in [tz, f"{lat}, {lon}" if lat != "" and lon != "" else ""] if p)
-        if extra:
-            st.caption(extra)
-
-    _live_geo()
-
-    # Peer keepalive — owned by the Go sidecar (TS_PORT+1); here we only display.
-    try:
-        auto_peers = st.fragment(run_every=60)
-    except TypeError:
-        auto_peers = st.fragment
-
-    @auto_peers
-    def _live_peers() -> None:
-        import json as _json
-
-        if not get_auth_key():
-            st.write("peers: waiting for TS_KEY — Go starts after the key is set")
-            return
-        try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{_go_port()}/peers", headers={"User-Agent": "tailit/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = _json.loads(r.read().decode())
-        except Exception as e:  # noqa: BLE001
-            try:
-                with open(os.path.join(INSTALL_DIR, "go.status")) as _gof:
-                    go_status = _gof.read().strip() or "unknown"
-            except OSError:
-                go_status = "not started yet (main pre-key)"
-            st.write(f"peers: go service not running (see log) — go.status: {go_status} err={e!r}"[:300])
-            return
-        rows = data.get("peers", []) if isinstance(data, dict) else []
-        if not rows:
-            st.write(f"peers: no TS_PEERS configured (interval {data.get('interval_sec', '?')}s)")
-            return
-        st.write(
-            "peers: "
-            + " | ".join(
-                f"{p.get('url')} {p.get('status')} {p.get('state')} {p.get('latency_ms')}ms"
-                for p in rows
-            )
-        )
-
-    _live_peers()
-
-    # Tailscale — auto start once per session with file lock
+    # Phase 1 — config gate. No checks run before the pipeline starts.
     if not get_auth_key():
         st.write("TS_KEY: missing")
         st.write("Set TS_KEY in Secrets (TOML key TS_KEY) or env, then Reboot app.")
@@ -1136,6 +1074,120 @@ def _run_as_streamlit_app() -> None:
     s3.metric("Status", "running" if rc == 0 else "error")
     st.caption(f"{get_hostname()} · {_tailscale_ip() or 'unknown'} · :{get_serve_port()} · go: {go_status}")
     st.code((st.session_state.get("tailit_log") or "")[-4000:] or "(empty)")
+
+    # Phase 3 — pipeline failed: show the log, run no checks.
+    if rc != 0:
+        st.error("startup failed — see log above, no live checks running")
+        return
+
+    # Phase 4 — live checks run only after compile + full launch.
+    # Live CPU / RAM
+    try:
+        auto_metrics = st.fragment(run_every=2)
+    except TypeError:
+        auto_metrics = st.fragment
+
+    @auto_metrics
+    def _live_metrics() -> None:
+        try:
+            total_mb, avail_mb = _read_mem_mb()
+            used_mb = total_mb - avail_mb
+            ram_pct = round(used_mb / total_mb * 100, 1) if total_mb else 0.0
+            ram_line = f"{_fmt_mb(used_mb)} / {_fmt_mb(total_mb)} ({ram_pct}%) — free {_fmt_mb(avail_mb)}"
+        except OSError:
+            ram_line = "unknown"
+        cpu = _cpu_pct()
+        cpu_line = f"{cpu}%" if cpu is not None else "unknown"
+        c1, c2 = st.columns(2)
+        c1.metric("CPU", cpu_line)
+        c2.metric("RAM", ram_line)
+
+    _live_metrics()
+
+    # Live public IP / geo
+    try:
+        auto_geo = st.fragment(run_every=60)
+    except TypeError:
+        auto_geo = st.fragment
+
+    @auto_geo
+    def _live_geo() -> None:
+        now = time.monotonic()
+        cached = st.session_state.get("tailit_geo") or {}
+        ts = st.session_state.get("tailit_geo_ts", 0.0)
+        if not cached or now - ts > 60:
+            try:
+                data = _fetch_geoip()
+                st.session_state["tailit_geo"] = data
+                st.session_state["tailit_geo_ts"] = now
+            except Exception:  # noqa: BLE001
+                data = cached
+        else:
+            data = cached
+        if not data:
+            st.metric("Public IP", "unknown")
+            return
+        country = f"{data.get('country', '')} {data.get('country_code', '')}".strip() or "unknown"
+        isp = (data.get("isp", "") or data.get("organization", "")) or "unknown"
+        asn = f"AS{data['asn']}" if data.get("asn") else "unknown"
+        g1, g2 = st.columns(2)
+        g1.metric("Public IP", str(data.get("ip", "unknown")))
+        g2.metric("Country", country)
+        g3, g4 = st.columns(2)
+        g3.metric("ISP", str(isp)[:32])
+        g4.metric("ASN", asn)
+        tz = str(data.get("timezone", "") or "").strip()
+        lat, lon = data.get("latitude", ""), data.get("longitude", "")
+        extra = " / ".join(p for p in [tz, f"{lat}, {lon}" if lat != "" and lon != "" else ""] if p)
+        if extra:
+            st.caption(extra)
+
+    _live_geo()
+
+    # Peer keepalive — owned by the Go sidecar (TS_PORT+1); here we only display.
+    try:
+        auto_peers = st.fragment(run_every=60)
+    except TypeError:
+        auto_peers = st.fragment
+
+    @auto_peers
+    def _live_peers() -> None:
+        import json as _json
+
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{_go_port()}/peers", headers={"User-Agent": "tailit/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = _json.loads(r.read().decode())
+        except Exception as e:  # noqa: BLE001
+            try:
+                with open(os.path.join(INSTALL_DIR, "go.status")) as _gof:
+                    go_status = _gof.read().strip() or "unknown"
+            except OSError:
+                go_status = "not started yet"
+            st.write(f"peers: go service not running (see log) — go.status: {go_status} err={e!r}"[:300])
+            return
+        if not isinstance(data, dict):
+            st.write("peers: bad response from Go service")
+            return
+        cfgd = data.get("configured", []) or []
+        rows = data.get("peers", []) or []
+        interval = data.get("interval_sec", "?")
+        if cfgd:
+            st.write(f"peers target ({interval}s): " + " | ".join(str(u) for u in cfgd))
+        if not rows:
+            st.write("peers: first sweep in progress — results on the next refresh")
+            return
+        st.write(
+            "peers: "
+            + " | ".join(
+                f"{p.get('url')} {p.get('status')} {p.get('state')} {p.get('latency_ms')}ms"
+                for p in rows
+            )
+        )
+
+    _live_peers()
 
 
 if __name__ == "__main__":
