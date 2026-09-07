@@ -179,11 +179,26 @@ def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _read_secret(name: str) -> str:
+    try:
+        import streamlit as st  # type: ignore[import]
+
+        v = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(v or "").strip()
+
+
 def get_auth_key() -> str:
     v = os.environ.get("TS_KEY", "").strip()
     if v:
         log(f"auth key from TS_KEY (len={len(v)})")
-    return v
+        return v
+    s = _read_secret("TS_KEY")
+    if s:
+        os.environ["TS_KEY"] = s
+        log(f"auth key from st.secrets TS_KEY (len={len(s)})")
+    return s
 
 
 def get_hostname() -> str:
@@ -994,14 +1009,22 @@ def _run_as_streamlit_app() -> None:
     def _live_peers() -> None:
         import json as _json
 
+        if not get_auth_key():
+            st.write("peers: waiting for TS_KEY — Go starts after the key is set")
+            return
         try:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{_go_port()}/peers", headers={"User-Agent": "tailit/1.0"}
             )
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = _json.loads(r.read().decode())
-        except Exception:
-            st.write("peers: go service not running (see log)")
+        except Exception as e:  # noqa: BLE001
+            try:
+                with open(os.path.join(INSTALL_DIR, "go.status")) as _gof:
+                    go_status = _gof.read().strip() or "unknown"
+            except OSError:
+                go_status = "not started yet (main pre-key)"
+            st.write(f"peers: go service not running (see log) — go.status: {go_status} err={e!r}"[:300])
             return
         rows = data.get("peers", []) if isinstance(data, dict) else []
         if not rows:
@@ -1020,7 +1043,17 @@ def _run_as_streamlit_app() -> None:
     # Tailscale — auto start once per session with file lock
     if not get_auth_key():
         st.write("TS_KEY: missing")
-        st.write("Set TS_KEY in Secrets.")
+        st.write("Set TS_KEY in Secrets (TOML key TS_KEY) or env, then Reboot app.")
+        try:
+            with open(os.path.join(INSTALL_DIR, "go.status")) as _gof:
+                _diag_go = _gof.read().strip() or "unknown"
+        except OSError:
+            _diag_go = "not started (expected pre-key)"
+        st.caption(
+            f"{get_hostname()} · :{get_serve_port()} · go: {_diag_go} · "
+            f"env TS_KEY={'set' if os.environ.get('TS_KEY', '').strip() else 'empty'} · "
+            f"secrets TS_KEY={'set' if _read_secret('TS_KEY') else 'empty'}"
+        )
         return
 
     if "tailit_started" not in st.session_state:
